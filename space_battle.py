@@ -1,4 +1,3 @@
-
 from lib.window_arena import *
 from lib.winobj_ship import *
 from typing import List
@@ -9,7 +8,7 @@ import time
 def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]):
     ship.setPlayerName("Karim M")
 
-    # ---------------- SETTINGS ----------------
+    # Settings
     BULLET_SPEED = 8.0
     MAX_MOVE = 8.0
     WALL_MARGIN = 0.8
@@ -22,7 +21,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
     maxX = ship.window.maxCoordinateX()
     maxY = ship.window.maxCoordinateY()
 
-    # ---------------- SCORE AWARENESS ----------------
+    # Check the score
     scores = ship.window.levelScores
     myScore = scores[ship.playerIdx]
     enemyScore = scores[1 - ship.playerIdx]
@@ -33,7 +32,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
     if scoreDifference < 0:
         urgency = min(1.0, abs(scoreDifference) / 100.0)
 
-    # ---------------- HELPERS ----------------
+    # Small helper functions
     def clamp(value, low, high):
         return max(low, min(high, value))
 
@@ -86,7 +85,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
             and WALL_MARGIN < spot[1] < maxY - WALL_MARGIN
         )
 
-    # ---------------- MOVEMENT ----------------
+    # Move toward a position
     def flyTo(spot):
         spot = clampPosition(spot)
 
@@ -111,7 +110,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
 
         return False
 
-    # ---------------- PROJECTILE INTERCEPTION ----------------
+    # Work out when a shot will reach its target
     def solveProjectileTime(relativePosition, targetVelocity):
         a = dot(targetVelocity, targetVelocity) - BULLET_SPEED ** 2
         b = 2.0 * dot(relativePosition, targetVelocity)
@@ -153,7 +152,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
         projectileTime = 0.0
         turningDuration = 0.0
 
-        # Estimate the target's position when the ship finishes turning.
+        # Predict where the target will be
         for _ in range(10):
             turningDuration = turnTime(ship, aim)
 
@@ -181,7 +180,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
 
             aim = newAim
 
-        # Final calculation using the updated aim point.
+        # Recheck the final aim
         turningDuration = turnTime(ship, aim)
 
         futureTargetAtLaunch = (
@@ -210,19 +209,18 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
 
         return aim, projectileTime, turningDuration
 
-    # ---------------- SHOT EVALUATION ----------------
+    # Decide if a shot is worth taking
     def evaluateShot(target, reward, baseConfidence, effectiveRadius):
         if target is None:
             return None
 
-        # Ships do not have timeTillDeath, so check safely.
         if not objectAvailable(target):
             return None
 
         result = calculateIntercept(target)
 
         if result is None:
-            # Direct aiming is acceptable for stationary targets.
+            # Use direct aim for stationary targets
             if length(target.vel) > 0.05:
                 return None
 
@@ -251,7 +249,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
 
         angle = abs(turnNeeded(ship.dir, aim - ship.pos))
 
-        # Shooting can insert a separate turning command.
         needsTurnCommand = angle > 2.6
 
         commandCost = 2.0
@@ -259,7 +256,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
         if needsTurnCommand:
             commandCost += 1.0
 
-        # Approximate collision reliability.
         sizeConfidence = clamp(
             effectiveRadius / 0.55,
             0.30,
@@ -268,7 +264,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
 
         confidence = baseConfidence * sizeConfidence
 
-        # Longer shots have more opportunity for prediction error.
         rangeFraction = (
             BULLET_SPEED * projectileTime
             / max(ship.ammoMaxRange, 0.001)
@@ -280,8 +275,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
         expectedPoints = reward * confidence
         netExpectedPoints = expectedPoints - commandCost
 
-        # Score urgency slightly favors scoring opportunities
-        # when we are behind, especially near the end.
         strategicPoints = expectedPoints
 
         if scoreDifference < 0:
@@ -304,7 +297,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
             "confidence": confidence
         }
 
-    # ---------------- 1. FIND BEST SHOT ----------------
+    # Find the best shot
     bestShot = None
     bestShotUtility = -100000.0
 
@@ -314,7 +307,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
     )
 
     if ship.ammo > 0 and cooldown <= 0:
-        # Evaluate ordinary targets.
         for target in targets:
             if not objectAvailable(target):
                 continue
@@ -342,7 +334,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
                     bestShot = shot
                     bestShotUtility = shot["utility"]
 
-        # Evaluate the opposing ship.
+        # Check if the enemy is a good shot
         if enemy is not None:
             enemySpeed = length(enemy.vel)
 
@@ -367,7 +359,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
                     bestShot = enemyShot
                     bestShotUtility = enemyUtility
 
-    # ---------------- 2. EVALUATE POWERUPS ----------------
+    # Look for useful powerups
     bestPowerUp = None
     bestPowerUpUtility = -100000.0
 
@@ -383,7 +375,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
             if myTime + ENDGAME_BUFFER >= timeLeft:
                 continue
 
-            # Avoid chasing pickups the enemy should reach first.
+            # Don't chase one the enemy will reach first
             if enemy is not None:
                 enemyTime = travelTime(enemy, powerUp.pos)
 
@@ -427,7 +419,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
             if ship.ammo == 0 and powerUp.type in ("1", "2", "3"):
                 utility *= 1.35
 
-            # Upgrades are less valuable near the end.
             if powerUp.type in ("S", "R"):
                 utility *= remainingFraction
 
@@ -435,7 +426,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
                 bestPowerUpUtility = utility
                 bestPowerUp = powerUp
 
-    # ---------------- 3. CHOOSE SHOT OR POWERUP ----------------
+    # Choose between shooting and collecting
     if bestShot is not None:
         if bestPowerUp is None or bestShotUtility >= bestPowerUpUtility:
             ship.queueCommand(
@@ -447,7 +438,7 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
         if flyTo(bestPowerUp.pos):
             return
 
-    # ---------------- 4. POSITIONING ----------------
+    # Move into a better position
     if ship.ammo > 0 and timeLeft > 3.0:
         bestDestination = None
         bestPositionUtility = -100000.0
@@ -502,7 +493,6 @@ def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]
             flyTo(bestDestination)
             return
 
-    # ---------------- 5. FALLBACK ----------------
     return
 
 
