@@ -1,166 +1,518 @@
+
 from lib.window_arena import *
 from lib.winobj_ship import *
 from typing import List
+import math
+import time
 
-# update ship (this is where your code goes)
-# Karim M's bot. Every time the game asks for new commands:
-#   1. If I have ammo and a quick shot, shoot it (aiming where the target is going).
-#   2. Otherwise fly to the best powerup (ammo first if I'm out).
-#   3. If no powerup is worth it, fly to where the nearest target is heading.
-# Every command costs points (-1 for a move or turn, -2 for a shot), so the bot
-# only does one useful thing at a time.
+
 def updateShipMohamed(ship: Ship, powerUps: List[PowerUp], targets: List[Target]):
     ship.setPlayerName("Karim M")
 
-    # Settings (picked by testing lots of practice matches)
-    BULLET_SPEED = 8          # how fast bullets fly (units per second)
-    ENEMY_SHOT_RANGE = 4      # only shoot the enemy ship when it's this close
-    AMMO_BONUS = 2            # how many seconds I'll "go out of my way" for ammo when I'm empty
-    PACK_BONUS = 0.3          # extra seconds per ammo in the pack (a 3-pack beats a 1-pack)
-    LATE_BOOST_PENALTY = 3    # boosts barely help in the last 30 seconds
-    POWERUP_LIMIT = 3         # with ammo, skip powerups more than this many seconds away
-    MAX_MOVE = 8              # longest single move, so I can rethink on the way
+    # ---------------- SETTINGS ----------------
+    BULLET_SPEED = 8.0
+    MAX_MOVE = 8.0
+    WALL_MARGIN = 0.8
+    PREFERRED_RANGE = 5.5
+    ENDGAME_BUFFER = 0.3
 
-    timeLeft = ship.window.levelTime
-    enemy = ship.getOther()          # None if there's no other ship
+    timeLeft = max(0.0, ship.window.levelTime)
+    enemy = ship.getOther()
+
     maxX = ship.window.maxCoordinateX()
     maxY = ship.window.maxCoordinateY()
 
-    # Distance from point a to point b
+    # ---------------- SCORE AWARENESS ----------------
+    scores = ship.window.levelScores
+    myScore = scores[ship.playerIdx]
+    enemyScore = scores[1 - ship.playerIdx]
+
+    scoreDifference = myScore - enemyScore
+
+    urgency = 0.0
+    if scoreDifference < 0:
+        urgency = min(1.0, abs(scoreDifference) / 100.0)
+
+    # ---------------- HELPERS ----------------
+    def clamp(value, low, high):
+        return max(low, min(high, value))
+
     def distance(a, b):
         return length(b - a)
 
-    # Degrees to turn from one direction to another, between -180 and 180.
-    # Positive = counterclockwise, negative = clockwise.
+    def objectAvailable(obj):
+        return getattr(obj, "timeTillDeath", 0) <= 0
+
     def turnNeeded(facing, direction):
+        if length(direction) < 0.0001:
+            return 0.0
+
         angle = angleDeg(direction) - angleDeg(facing)
+
         while angle > 180:
-            angle = angle - 360
+            angle -= 360
+
         while angle < -180:
-            angle = angle + 360
+            angle += 360
+
         return angle
 
-    # Seconds for a ship to turn toward a spot, and to turn + fly there
     def turnTime(someShip, spot):
-        return abs(turnNeeded(someShip.dir, spot - someShip.pos)) / someShip.shipTurnSpeed
+        if someShip.shipTurnSpeed <= 0:
+            return 1000.0
+
+        angle = turnNeeded(someShip.dir, spot - someShip.pos)
+
+        return abs(angle) / someShip.shipTurnSpeed
 
     def travelTime(someShip, spot):
-        return turnTime(someShip, spot) + distance(someShip.pos, spot) / someShip.shipMoveSpeed
+        if someShip.shipMoveSpeed <= 0:
+            return 1000.0
 
-    # True if a spot is inside the arena (not too close to the edge)
+        return (
+            turnTime(someShip, spot)
+            + distance(someShip.pos, spot) / someShip.shipMoveSpeed
+        )
+
+    def clampPosition(spot):
+        return v2(
+            clamp(spot[0], WALL_MARGIN, maxX - WALL_MARGIN),
+            clamp(spot[1], WALL_MARGIN, maxY - WALL_MARGIN)
+        )
+
     def onScreen(spot):
-        return spot[0] > 0.6 and spot[0] < maxX - 0.6 and spot[1] > 0.6 and spot[1] < maxY - 0.6
+        return (
+            WALL_MARGIN < spot[0] < maxX - WALL_MARGIN
+            and WALL_MARGIN < spot[1] < maxY - WALL_MARGIN
+        )
 
-    # Fly toward a spot: turn to face it, then thrust (at most MAX_MOVE units).
+    # ---------------- MOVEMENT ----------------
     def flyTo(spot):
+        spot = clampPosition(spot)
+
         direction = spot - ship.pos
+        dist = length(direction)
+
+        if dist < 0.4:
+            return False
+
         angle = turnNeeded(ship.dir, direction)
-        if angle > 1:
-            ship.queueCommand(ShipCmd_ThrustRight(angle))     # right thrusters turn counterclockwise
-        elif angle < -1:
-            ship.queueCommand(ShipCmd_ThrustLeft(-angle))     # left thrusters turn clockwise
-        moveBy = min(length(direction), MAX_MOVE)
+
+        if angle > 1.0:
+            ship.queueCommand(ShipCmd_ThrustRight(angle))
+        elif angle < -1.0:
+            ship.queueCommand(ShipCmd_ThrustLeft(-angle))
+
+        moveBy = min(dist, MAX_MOVE)
+
         if moveBy > 0.3:
             ship.queueCommand(ShipCmd_Thrust(moveBy))
+            return True
 
-    # ---------- 1. Shoot ----------
-    if ship.ammo > 0:
-        bestAim = None
-        bestTime = 1000
+        return False
 
-        for target in targets:
-            if target.isDying():
-                continue
-            # Guess where the target will be, then improve the guess once using the better spot.
-            # time = time to turn toward it + time for the bullet to fly there
+    # ---------------- PROJECTILE INTERCEPTION ----------------
+    def solveProjectileTime(relativePosition, targetVelocity):
+        a = dot(targetVelocity, targetVelocity) - BULLET_SPEED ** 2
+        b = 2.0 * dot(relativePosition, targetVelocity)
+        c = dot(relativePosition, relativePosition)
+
+        if abs(a) < 0.00001:
+            if abs(b) < 0.00001:
+                return None
+
+            result = -c / b
+
+            if result > 0.001:
+                return result
+
+            return None
+
+        discriminant = b * b - 4.0 * a * c
+
+        if discriminant < 0:
+            return None
+
+        root = math.sqrt(discriminant)
+
+        t1 = (-b - root) / (2.0 * a)
+        t2 = (-b + root) / (2.0 * a)
+
+        validTimes = [t for t in (t1, t2) if t > 0.001]
+
+        if not validTimes:
+            return None
+
+        return min(validTimes)
+
+    def calculateIntercept(target):
+        targetPos = target.pos
+        targetVel = target.vel
+
+        aim = targetPos
+        projectileTime = 0.0
+        turningDuration = 0.0
+
+        # Estimate the target's position when the ship finishes turning.
+        for _ in range(10):
+            turningDuration = turnTime(ship, aim)
+
+            futureTargetAtLaunch = (
+                targetPos + targetVel * turningDuration
+            )
+
+            relativePosition = futureTargetAtLaunch - ship.pos
+
+            projectileTime = solveProjectileTime(
+                relativePosition,
+                targetVel
+            )
+
+            if projectileTime is None:
+                return None
+
+            newAim = targetPos + targetVel * (
+                turningDuration + projectileTime
+            )
+
+            if distance(aim, newAim) < 0.01:
+                aim = newAim
+                break
+
+            aim = newAim
+
+        # Final calculation using the updated aim point.
+        turningDuration = turnTime(ship, aim)
+
+        futureTargetAtLaunch = (
+            targetPos + targetVel * turningDuration
+        )
+
+        projectileTime = solveProjectileTime(
+            futureTargetAtLaunch - ship.pos,
+            targetVel
+        )
+
+        if projectileTime is None:
+            return None
+
+        aim = targetPos + targetVel * (
+            turningDuration + projectileTime
+        )
+
+        shotDistance = BULLET_SPEED * projectileTime
+
+        if shotDistance > ship.ammoMaxRange:
+            return None
+
+        if not onScreen(aim):
+            return None
+
+        return aim, projectileTime, turningDuration
+
+    # ---------------- SHOT EVALUATION ----------------
+    def evaluateShot(target, reward, baseConfidence, effectiveRadius):
+        if target is None:
+            return None
+
+        # Ships do not have timeTillDeath, so check safely.
+        if not objectAvailable(target):
+            return None
+
+        result = calculateIntercept(target)
+
+        if result is None:
+            # Direct aiming is acceptable for stationary targets.
+            if length(target.vel) > 0.05:
+                return None
+
             aim = target.pos
-            time = 0
-            for i in range(2):
-                time = turnTime(ship, aim) + max(distance(ship.pos, aim) - 0.5, 0) / BULLET_SPEED
-                aim = target.pos + target.vel * time
-            d = distance(ship.pos, aim)
-            if d > 0.8 and d < ship.ammoMaxRange - 0.5 and onScreen(aim) and time < timeLeft - 0.2:
-                if time < bestTime:                    # the quickest shot is the surest shot
-                    bestTime = time
-                    bestAim = aim
+            shotDistance = distance(ship.pos, aim)
 
-        # The enemy ship is worth more (+25 vs +20), but it's small and it moves on its own,
-        # so I only shoot it when it's close and not moving, and quicker to hit than a target.
-        if enemy is not None and length(enemy.vel) < 0.1:
-            d = distance(ship.pos, enemy.pos)
-            time = turnTime(ship, enemy.pos) + d / BULLET_SPEED
-            if d > 0.8 and d < ENEMY_SHOT_RANGE and time < timeLeft - 0.2 and time < bestTime:
-                bestAim = enemy.pos
+            if shotDistance < 0.001:
+                return None
 
-        if bestAim is not None:
-            ship.queueCommand(ShipCmd_Shoot(bestAim - ship.pos))
+            if shotDistance > ship.ammoMaxRange:
+                return None
+
+            projectileTime = shotDistance / BULLET_SPEED
+            turningDuration = turnTime(ship, aim)
+
+        else:
+            aim, projectileTime, turningDuration = result
+
+        totalTime = turningDuration + projectileTime
+
+        if totalTime + ENDGAME_BUFFER >= timeLeft:
+            return None
+
+        if not onScreen(aim):
+            return None
+
+        angle = abs(turnNeeded(ship.dir, aim - ship.pos))
+
+        # Shooting can insert a separate turning command.
+        needsTurnCommand = angle > 2.6
+
+        commandCost = 2.0
+
+        if needsTurnCommand:
+            commandCost += 1.0
+
+        # Approximate collision reliability.
+        sizeConfidence = clamp(
+            effectiveRadius / 0.55,
+            0.30,
+            1.0
+        )
+
+        confidence = baseConfidence * sizeConfidence
+
+        # Longer shots have more opportunity for prediction error.
+        rangeFraction = (
+            BULLET_SPEED * projectileTime
+            / max(ship.ammoMaxRange, 0.001)
+        )
+
+        confidence *= 1.0 - 0.10 * rangeFraction
+        confidence = clamp(confidence, 0.10, 0.99)
+
+        expectedPoints = reward * confidence
+        netExpectedPoints = expectedPoints - commandCost
+
+        # Score urgency slightly favors scoring opportunities
+        # when we are behind, especially near the end.
+        strategicPoints = expectedPoints
+
+        if scoreDifference < 0:
+            lateGameFactor = max(0.0, 1.0 - timeLeft / 90.0)
+
+            strategicPoints *= (
+                1.0 + urgency * lateGameFactor * 0.15
+            )
+
+        utility = (
+            strategicPoints - commandCost
+        ) / (0.45 + totalTime)
+
+        return {
+            "aim": aim,
+            "utility": utility,
+            "expected": expectedPoints,
+            "net": netExpectedPoints,
+            "time": totalTime,
+            "confidence": confidence
+        }
+
+    # ---------------- 1. FIND BEST SHOT ----------------
+    bestShot = None
+    bestShotUtility = -100000.0
+
+    cooldown = max(
+        0.0,
+        1.0 - (time.time() - ship.timeLastShot)
+    )
+
+    if ship.ammo > 0 and cooldown <= 0:
+        # Evaluate ordinary targets.
+        for target in targets:
+            if not objectAvailable(target):
+                continue
+
+            moving = (
+                length(target.vel) > 0.001
+            )
+
+            if moving:
+                effectiveRadius = target.radius * (2.0 / 3.0) + 0.15
+                baseConfidence = 0.96
+            else:
+                effectiveRadius = target.radius + 0.15
+                baseConfidence = 0.98
+
+            shot = evaluateShot(
+                target,
+                reward=20.0,
+                baseConfidence=baseConfidence,
+                effectiveRadius=effectiveRadius
+            )
+
+            if shot is not None:
+                if shot["utility"] > bestShotUtility:
+                    bestShot = shot
+                    bestShotUtility = shot["utility"]
+
+        # Evaluate the opposing ship.
+        if enemy is not None:
+            enemySpeed = length(enemy.vel)
+
+            enemyConfidence = (
+                0.78 if enemySpeed < 0.5 else 0.66
+            )
+
+            enemyShot = evaluateShot(
+                enemy,
+                reward=25.0,
+                baseConfidence=enemyConfidence,
+                effectiveRadius=0.40
+            )
+
+            if enemyShot is not None:
+                enemyUtility = enemyShot["utility"]
+
+                if scoreDifference < 0:
+                    enemyUtility *= 1.0 + urgency * 0.12
+
+                if enemyUtility > bestShotUtility:
+                    bestShot = enemyShot
+                    bestShotUtility = enemyUtility
+
+    # ---------------- 2. EVALUATE POWERUPS ----------------
+    bestPowerUp = None
+    bestPowerUpUtility = -100000.0
+
+    remainingFraction = clamp(timeLeft / 90.0, 0.0, 1.0)
+
+    if timeLeft > 2.0:
+        for powerUp in powerUps:
+            if not objectAvailable(powerUp):
+                continue
+
+            myTime = travelTime(ship, powerUp.pos)
+
+            if myTime + ENDGAME_BUFFER >= timeLeft:
+                continue
+
+            # Avoid chasing pickups the enemy should reach first.
+            if enemy is not None:
+                enemyTime = travelTime(enemy, powerUp.pos)
+
+                if enemyTime + 0.6 < myTime:
+                    continue
+
+            benefit = 0.0
+
+            if powerUp.type in ("1", "2", "3"):
+                amount = int(powerUp.type)
+
+                if ship.ammo == 0:
+                    valuePerAmmo = 15.0
+                elif ship.ammo <= 2:
+                    valuePerAmmo = 11.0
+                elif ship.ammo <= 5:
+                    valuePerAmmo = 7.0
+                else:
+                    valuePerAmmo = 3.0
+
+                benefit = amount * valuePerAmmo
+
+            elif powerUp.type == "S":
+                benefit = 17.0 * (remainingFraction ** 0.8)
+
+            elif powerUp.type == "R":
+                benefit = 12.0 * (remainingFraction ** 0.8)
+
+            else:
+                continue
+
+            movementCost = 2.0
+
+            if myTime > 5.0:
+                movementCost += 1.0
+
+            netBenefit = benefit - movementCost
+
+            utility = netBenefit / (0.8 + myTime)
+
+            if ship.ammo == 0 and powerUp.type in ("1", "2", "3"):
+                utility *= 1.35
+
+            # Upgrades are less valuable near the end.
+            if powerUp.type in ("S", "R"):
+                utility *= remainingFraction
+
+            if utility > bestPowerUpUtility:
+                bestPowerUpUtility = utility
+                bestPowerUp = powerUp
+
+    # ---------------- 3. CHOOSE SHOT OR POWERUP ----------------
+    if bestShot is not None:
+        if bestPowerUp is None or bestShotUtility >= bestPowerUpUtility:
+            ship.queueCommand(
+                ShipCmd_Shoot(bestShot["aim"] - ship.pos)
+            )
             return
 
-    # Near the end, moving can't earn points anymore, so don't spend any
-    if timeLeft < 1.5:
-        return
+    if bestPowerUp is not None and bestPowerUpUtility >= 1.5:
+        if flyTo(bestPowerUp.pos):
+            return
 
-    # ---------- 2. Pick the best powerup ----------
-    # Score = seconds to get there, adjusted for how useful it is. Lower is better.
-    bestPowerUp = None
-    bestScore = 1000
-    for powerUp in powerUps:
-        if powerUp.isDying():
-            continue
-        myTime = travelTime(ship, powerUp.pos)
+    # ---------------- 4. POSITIONING ----------------
+    if ship.ammo > 0 and timeLeft > 3.0:
+        bestDestination = None
+        bestPositionUtility = -100000.0
 
-        # Skip powerups the enemy will clearly reach first
-        if enemy is not None and travelTime(enemy, powerUp.pos) < myTime * 0.7:
-            continue
-
-        score = myTime
-        if powerUp.type == "1" or powerUp.type == "2" or powerUp.type == "3":
-            if ship.ammo == 0:
-                score = score - AMMO_BONUS
-            score = score - int(powerUp.type) * PACK_BONUS
-        elif powerUp.type == "R" or powerUp.type == "S":
-            if timeLeft < 30:
-                score = score + LATE_BOOST_PENALTY
-
-        if score < bestScore:
-            bestScore = score
-            bestPowerUp = powerUp
-
-    if bestPowerUp is not None and (ship.ammo == 0 or bestScore < POWERUP_LIMIT):
-        flyTo(bestPowerUp.pos)
-        return
-
-    # ---------- 3. Get in range of the nearest target ----------
-    if ship.ammo > 0:
-        closest = None
-        closestTime = 1000
         for target in targets:
-            if target.isDying():
+            if not objectAvailable(target):
                 continue
-            t = travelTime(ship, target.pos)
-            if t < closestTime:
-                closestTime = t
-                closest = target
 
-        if closest is not None:
-            # Head for where the target will be by the time I get there
-            future = closest.pos + closest.vel * closestTime
-            toTarget = future - ship.pos
-            moveBy = length(toTarget) - ship.ammoMaxRange * 0.5
-            if moveBy > 0.5:
-                flyTo(ship.pos + unit(toTarget) * moveBy)
-                return
+            currentDistance = distance(ship.pos, target.pos)
 
-    # Nothing else to do: go get the best powerup anyway
-    if bestPowerUp is not None:
-        flyTo(bestPowerUp.pos)
+            estimatedTime = currentDistance / max(
+                ship.shipMoveSpeed,
+                0.001
+            )
 
+            futureTarget = target.pos + target.vel * estimatedTime
+
+            toTarget = futureTarget - ship.pos
+            futureDistance = length(toTarget)
+
+            if futureDistance < 0.001:
+                continue
+
+            desiredRange = min(
+                PREFERRED_RANGE,
+                ship.ammoMaxRange * 0.65
+            )
+
+            if futureDistance <= desiredRange + 0.8:
+                continue
+
+            destination = (
+                futureTarget - unit(toTarget) * desiredRange
+            )
+
+            destination = clampPosition(destination)
+
+            movementTime = travelTime(ship, destination)
+
+            if movementTime + ENDGAME_BUFFER >= timeLeft:
+                continue
+
+            positionUtility = (
+                futureDistance - desiredRange
+            ) / (1.0 + movementTime)
+
+            if positionUtility > bestPositionUtility:
+                bestPositionUtility = positionUtility
+                bestDestination = destination
+
+        if bestDestination is not None:
+            flyTo(bestDestination)
+            return
+
+    # ---------------- 5. FALLBACK ----------------
+    return
 
 
 ####################################################################################################
-############################## DO NOT MODIFY  METHODS BELOW THIS LINE ##############################
-########################## EXCEPT TO REMOVE TUTORIAL GAME CONFIG ARGUMENT  #########################
+############################## DO NOT MODIFY METHODS BELOW THIS LINE ##############################
+########################## EXCEPT TO REMOVE TUTORIAL GAME CONFIG ARGUMENT #########################
 ####################################################################################################
-WindowArena(userCode1 = updateShipMohamed,
-            gameConfig = WindowArenaConfig.SPACE_BATTLE,
-            windowTitle = "TSA@RHS: Space Battle!").runGameLoop()
+
+WindowArena(
+    userCode1=updateShipMohamed,
+    gameConfig=WindowArenaConfig.SPACE_BATTLE,
+    windowTitle="TSA@RHS: Space Battle V3!"
+).runGameLoop()
